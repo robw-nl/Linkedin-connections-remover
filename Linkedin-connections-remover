@@ -1,0 +1,299 @@
+// ==UserScript==
+// @name         LinkedIn Auto-Remove Connections (UI Clicker)
+// @version      1.0
+// @description  Clicks 3-buttons -> Remove connection -> Confirm popup with randomized delays
+// @author       Rob Wijhenke
+// @match        https://www.linkedin.com/mynetwork/invite-connect/connections/*
+// @grant        none
+// @use          Install in ScriptCat or Tampermonkey, save. Open the Linkedin connections page, run
+// ==/UserScript==
+
+(function () {
+    'use strict';
+
+    let isRunning = false;
+    let removedCount = 0;
+
+    // Randomized delay helper (ms) to mimic human pacing and let React render popups
+    const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+    const rand = (min, max) => Math.floor(Math.random() * (max - min + 1)) + min;
+
+    // Create minimal floating UI panel
+    function createControlPanel() {
+        if (document.getElementById('li-remover-panel')) return;
+
+        const panel = document.createElement('div');
+        panel.id = 'li-remover-panel';
+        Object.assign(panel.style, {
+            position: 'fixed',
+            bottom: '20px',
+            right: '20px',
+            zIndex: '99999',
+            backgroundColor: '#ffffff',
+            border: '1px solid #d0d7de',
+            borderRadius: '8px',
+            padding: '12px 16px',
+            boxShadow: '0 4px 12px rgba(0,0,0,0.15)',
+            fontFamily: 'system-ui, -apple-system, sans-serif',
+            fontSize: '13px',
+            color: '#1f2328',
+            display: 'flex',
+            flexDirection: 'column',
+            gap: '8px',
+            minWidth: '210px'
+        });
+
+        panel.innerHTML = `
+            <div style="font-weight: 600; display: flex; justify-content: space-between;">
+                <span>Connection Remover</span>
+                <span id="li-rem-count" style="color: #0a66c2;">0 removed</span>
+            </div>
+            <div id="li-rem-status" style="font-size: 12px; color: #59636e;">Idle</div>
+            <div style="display: flex; gap: 8px; margin-top: 4px;">
+                <button id="li-rem-start" style="flex: 1; padding: 6px 10px; background: #0a66c2; color: #fff; border: none; border-radius: 16px; font-weight: 600; cursor: pointer;">Start</button>
+                <button id="li-rem-stop" style="flex: 1; padding: 6px 10px; background: #e5e7eb; color: #1f2328; border: none; border-radius: 16px; font-weight: 600; cursor: pointer;" disabled>Stop</button>
+            </div>
+        `;
+
+        document.body.appendChild(panel);
+
+        document.getElementById('li-rem-start').addEventListener('click', startLoop);
+        document.getElementById('li-rem-stop').addEventListener('click', stopLoop);
+    }
+
+    function updateUI(statusText) {
+        const statusEl = document.getElementById('li-rem-status');
+        const countEl = document.getElementById('li-rem-count');
+        const startBtn = document.getElementById('li-rem-start');
+        const stopBtn = document.getElementById('li-rem-stop');
+
+        if (statusEl && statusText) statusEl.textContent = statusText;
+        if (countEl) countEl.textContent = `${removedCount} removed`;
+        if (startBtn) startBtn.disabled = isRunning;
+        if (stopBtn) stopBtn.disabled = !isRunning;
+    }
+
+    // Find the first visible 3-dots trigger button in the connections list
+    function findThreeDotsButton() {
+        // LinkedIn uses artdeco-dropdown triggers or aria-labels like "More actions" / "Open options"
+        const candidates = Array.from(document.querySelectorAll('button')).filter((btn) => {
+            if (btn.offsetParent === null) return false; // ignore hidden elements
+            const label = (btn.getAttribute('aria-label') || '').toLowerCase();
+            const isDropdownTrigger = btn.classList.contains('artdeco-dropdown__trigger');
+            const hasMoreIcon = btn.querySelector('svg[data-test-icon="overflow-web-ios-small"], use[href*="overflow"]');
+
+            // Exclude top navbar "More" button
+            if (btn.closest('header, nav')) return false;
+
+            return (
+                label.includes('more actions') ||
+                label.includes('open options') ||
+                (isDropdownTrigger && hasMoreIcon)
+            );
+        });
+
+        return candidates[0] || null;
+    }
+
+    // Find the dropdown item "Remove connection" (outside any modal dialog)
+    function findDropdownRemoveOption() {
+        const elements = Array.from(
+            document.querySelectorAll('[role="menuitem"], .artdeco-dropdown__item, li div[role="button"], li button, li span')
+        );
+
+        for (const el of elements) {
+            if (el.offsetParent === null) continue;
+            if (el.closest('[role="dialog"], .artdeco-modal')) continue; // Skip modal buttons
+
+            const text = el.textContent.trim().toLowerCase();
+            if (text === 'remove connection') {
+                return el.closest('[role="menuitem"], .artdeco-dropdown__item, button, [role="button"]') || el;
+            }
+        }
+        return null;
+    }
+
+// Dispatch a full mouse click event so React/Ember event listeners always fire
+    function triggerRealClick(el) {
+        if (!el) return;
+        el.focus();
+        ['mousedown', 'mouseup', 'click'].forEach((type) => {
+            el.dispatchEvent(
+                new MouseEvent(type, {
+                    view: window,
+                    bubbles: true,
+                    cancelable: true
+                })
+            );
+        });
+    }
+
+    // Find the blue primary "Remove connection" confirmation button inside the popup modal
+    function findModalConfirmButton() {
+        // 1. Check standard modal containers (<dialog>, role="dialog", aria-modal, artdeco-modal)
+        const dialogs = Array.from(
+            document.querySelectorAll('dialog[open], [role="dialog"], [aria-modal="true"], .artdeco-modal')
+        );
+        for (const dialog of dialogs) {
+            if (dialog.offsetParent === null && dialog.tagName !== 'DIALOG') continue;
+            const buttons = Array.from(dialog.querySelectorAll('button'));
+            for (const btn of buttons) {
+                if (btn.textContent.trim().toLowerCase() === 'remove connection') {
+                    return btn;
+                }
+            }
+        }
+
+        // 2. Fallback: find a visible <button> with exact text "Remove connection" (the dropdown item is a div/li/span, while the modal action is a <button> next to "Cancel")
+        const allButtons = Array.from(document.querySelectorAll('button')).filter(
+            (btn) => btn.offsetParent !== null && btn.textContent.trim().toLowerCase() === 'remove connection'
+        );
+        for (const btn of allButtons) {
+            const parent = btn.parentElement;
+            if (parent && parent.textContent.toLowerCase().includes('cancel')) {
+                return btn;
+            }
+        }
+
+        return null;
+    }
+
+    // Find the blue primary "Remove connection" confirmation button inside the popup modal
+    function findModalConfirmButton() {
+        // 1. Check standard modal containers (<dialog>, role="dialog", aria-modal, artdeco-modal)
+        const dialogs = Array.from(
+            document.querySelectorAll('dialog[open], [role="dialog"], [aria-modal="true"], .artdeco-modal')
+        );
+        for (const dialog of dialogs) {
+            if (dialog.offsetParent === null && dialog.tagName !== 'DIALOG') continue;
+            const buttons = Array.from(dialog.querySelectorAll('button'));
+            for (const btn of buttons) {
+                if (btn.textContent.trim().toLowerCase() === 'remove connection') {
+                    return btn;
+                }
+            }
+        }
+
+        // 2. Fallback: find a visible <button> with exact text "Remove connection" (the dropdown item is a div/li/span, while the modal action is a <button> next to "Cancel")
+        const allButtons = Array.from(document.querySelectorAll('button')).filter(
+            (btn) => btn.offsetParent !== null && btn.textContent.trim().toLowerCase() === 'remove connection'
+        );
+        for (const btn of allButtons) {
+            const parent = btn.parentElement;
+            if (parent && parent.textContent.toLowerCase().includes('cancel')) {
+                return btn;
+            }
+        }
+
+        return null;
+    }  
+
+    // Find the blue primary "Remove connection" confirmation button inside the popup modal
+    function findModalConfirmButton() {
+        // 1. Check standard modal containers (<dialog>, role="dialog", aria-modal, artdeco-modal)
+        const dialogs = Array.from(
+            document.querySelectorAll('dialog[open], [role="dialog"], [aria-modal="true"], .artdeco-modal')
+        );
+        for (const dialog of dialogs) {
+            if (dialog.offsetParent === null && dialog.tagName !== 'DIALOG') continue;
+            const buttons = Array.from(dialog.querySelectorAll('button'));
+            for (const btn of buttons) {
+                if (btn.textContent.trim().toLowerCase() === 'remove connection') {
+                    return btn;
+                }
+            }
+        }
+
+        // 2. Fallback: find a visible <button> with exact text "Remove connection" (the dropdown item is a div/li/span, while the modal action is a <button> next to "Cancel")
+        const allButtons = Array.from(document.querySelectorAll('button')).filter(
+            (btn) => btn.offsetParent !== null && btn.textContent.trim().toLowerCase() === 'remove connection'
+        );
+        for (const btn of allButtons) {
+            const parent = btn.parentElement;
+            if (parent && parent.textContent.toLowerCase().includes('cancel')) {
+                return btn;
+            }
+        }
+
+        return null;
+    }
+
+    function stopLoop() {
+        isRunning = false;
+        updateUI('Stopped by user.');
+    }
+
+    async function startLoop() {
+        if (isRunning) return;
+        isRunning = true;
+        updateUI('Starting...');
+
+        while (isRunning) {
+            // If a confirmation modal is already open on screen, confirm it first
+            const existingConfirm = findModalConfirmButton();
+            if (existingConfirm) {
+                updateUI('Confirming open popup...');
+                triggerRealClick(existingConfirm);
+                removedCount++;
+                await sleep(rand(2500, 4500));
+                continue;
+            }
+
+            // 1. Locate the top connection's 3-dots button
+            let threeDots = findThreeDotsButton();
+
+            if (!threeDots) {
+                updateUI('Scrolling to load more...');
+                window.scrollBy(0, 600);
+                await sleep(2500);
+                threeDots = findThreeDotsButton();
+
+                if (!threeDots) {
+                    updateUI('Done! No more connections found.');
+                    isRunning = false;
+                    updateUI();
+                    break;
+                }
+            }
+
+            threeDots.scrollIntoView({ behavior: 'smooth', block: 'center' });
+            await sleep(rand(400, 700));
+
+            // 2. Click the 3-dots menu
+            updateUI('Opening menu...');
+            triggerRealClick(threeDots);
+            await sleep(rand(800, 1300));
+
+            // 3. Click "Remove connection" in the dropdown
+            const menuOption = findDropdownRemoveOption();
+            if (!menuOption) {
+                updateUI('Menu option not found, retrying...');
+                document.body.click();
+                await sleep(1500);
+                continue;
+            }
+
+            updateUI('Clicking Remove connection...');
+            triggerRealClick(menuOption);
+            await sleep(rand(900, 1500));
+
+            // 4. Click "Remove connection" in the confirmation popup
+            const confirmBtn = findModalConfirmButton();
+            if (!confirmBtn) {
+                updateUI('Popup button not found, retrying...');
+                await sleep(1500);
+                continue;
+            }
+
+            updateUI('Confirming removal...');
+            triggerRealClick(confirmBtn);
+            removedCount++;
+            updateUI('Waiting before next...');
+
+            await sleep(rand(2500, 4500));
+        }
+    }
+
+    // Initialize panel once page settles
+    setTimeout(createControlPanel, 1500);
+})();
